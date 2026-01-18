@@ -1,0 +1,12 @@
+plugins:
+  single_login_shared_enabled:
+    default: true
+    client: false
+
+  single_login_shared_username:
+    default: "shared_account"
+    client: false
+
+  single_login_shared_timeout_hours:
+    default: 3
+    client: false
