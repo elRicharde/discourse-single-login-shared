@@ -44,7 +44,11 @@ after_initialize do
       user  = login.present? ? User.find_by_username_or_email(login) : nil
 
       if ::SingleLoginShared.shared_user?(user) && ::SingleLoginShared.locked?(user.id)
-        render json: { error: I18n.t("login.already_logged_in_single_session") }, status: 403
+        render json: {
+          error: I18n.t("login.already_logged_in_single_session"),
+          errors: [I18n.t("login.already_logged_in_single_session")],
+          reason: "already_logged_in_single_session"
+        }, status: 422
         return
       end
 
