@@ -67,19 +67,17 @@ after_initialize do
     end
 
     def self.force_logout!(user)
-      # logout all sessions/tokens for this user
       UserAuthToken.where(user_id: user.id).find_each do |t|
         begin
           t.log_out!(SessionManager.new(nil, nil))
         rescue
-          # fallback: token destroy invalidiert ebenfalls
         ensure
           t.destroy!
         end
       end
 
       clear_all!(user.id)
-      handle_logout_side_effects!(user, reason: "timeout")
+      ::SingleLoginShared.handle_logout_side_effects!(user, reason: "timeout")
     end
 
     def self.should_logout?(user_id)
@@ -114,6 +112,123 @@ after_initialize do
         force_logout!(user) if logout
       end
     end
+
+    def self.system_user_id
+      Discourse.system_user&.id
+    end
+
+    def self.topic_involves_system?(topic_id)
+      sid = system_user_id
+      return false if sid.blank?
+      TopicAllowedUser.where(topic_id: topic_id, user_id: sid).exists?
+    end
+
+    def self.topic_involves_staff_users?(topic_id)
+      TopicAllowedUser
+        .joins(:user)
+        .where(topic_id: topic_id)
+        .where("users.admin = ? OR users.moderator = ?", true, true)
+        .exists?
+    end
+
+    def self.topic_involves_staff_groups?(topic_id)
+      # Falls eine PN z.B. an eine Staff/Mods/Admins-Gruppe ging.
+      # Discourse hat i.d.R. :staff, :admins, :moderators
+      staff_group_ids = []
+      [:staff, :admins, :moderators].each do |sym|
+        g = Group.find_by(name: sym.to_s)
+        staff_group_ids << g.id if g
+      end
+
+      return false if staff_group_ids.empty?
+
+      TopicAllowedGroup.where(topic_id: topic_id, group_id: staff_group_ids).exists?
+    end
+
+    def self.topic_has_team_or_system?(topic_id)
+      topic_involves_system?(topic_id) ||
+        topic_involves_staff_users?(topic_id) ||
+        topic_involves_staff_groups?(topic_id)
+    end
+
+    def self.pm_topic_ids_where_user_posted(user_id)
+      Post
+        .joins(:topic)
+        .where(user_id: user_id)
+        .where("topics.archetype = ?", Archetype.private_message)
+        .distinct
+        .pluck("topics.id")
+    end
+
+    def self.remove_user_from_pm_topics!(user)
+      topic_ids = pm_topic_ids_where_user_posted(user.id)
+      return 0 if topic_ids.blank?
+
+      removed_topics = 0
+
+      topic_ids.each do |tid|
+        # NICHT anfassen, wenn Team oder System vorkommt
+        next if topic_has_team_or_system?(tid)
+
+        # User aus Allowed-Users entfernen -> Topic ist für ihn nicht mehr sichtbar
+        deleted = TopicAllowedUser.where(topic_id: tid, user_id: user.id).delete_all
+
+        if deleted > 0
+          removed_topics += 1
+          # optional housekeeping (Unreads/Tracking)
+          TopicUser.where(topic_id: tid, user_id: user.id).delete_all
+        end
+      end
+
+      removed_topics
+    end
+
+    def self.shared_user_has_trigger_pm?(user, title)
+      return false if title.blank?
+
+      Topic
+        .joins(:topic_allowed_users)
+        .where("topics.archetype = ?", Archetype.private_message)
+        .where("topic_allowed_users.user_id = ?", user.id)
+        .where("topics.title = ?", title)
+        .exists?
+    end
+
+    def self.send_trigger_pm!(shared_user, reason: nil)
+      title = (SiteSetting.single_login_shared_trigger_pm_title || "").strip
+      body  = (SiteSetting.single_login_shared_trigger_pm_body  || "").to_s
+      return if title.blank? || body.blank?
+
+      # Nur senden, wenn der SharedUser keine sichtbare PM mit exakt dem Titel mehr hat
+      return if shared_user_has_trigger_pm?(shared_user, title)
+
+      sender_name = (SiteSetting.single_login_shared_sender_username || "").strip
+      sender = sender_name.present? ? User.find_by(username: sender_name) : nil
+      sender ||= Discourse.system_user
+
+      group_name = (SiteSetting.single_login_shared_notify_group || "").strip
+      target_group_names = []
+      target_group_names << group_name if group_name.present?
+
+      body = "#{body}\n\n(Logout-Grund: #{reason})" if reason.present?
+
+      PostCreator.create!(
+        sender,
+        title: title,
+        raw: body,
+        archetype: Archetype.private_message,
+        target_usernames: shared_user.username,
+        target_group_names: target_group_names
+      )
+    end
+
+    def self.handle_logout_side_effects!(user, reason: nil)
+      return unless SiteSetting.single_login_shared_enabled
+      return unless shared_user?(user)
+
+      remove_user_from_pm_topics!(user)
+      send_trigger_pm!(user, reason: reason)
+    end    
   end
 
   # 1) Login blocken + nach erfolgreichem Login markieren
@@ -173,122 +288,4 @@ after_initialize do
       end
     end
   end
-
-  def self.system_user_id
-    Discourse.system_user&.id
-  end
-
-  def self.topic_involves_system?(topic_id)
-    sid = system_user_id
-    return false if sid.blank?
-    TopicAllowedUser.where(topic_id: topic_id, user_id: sid).exists?
-  end
-
-  def self.topic_involves_staff_users?(topic_id)
-    TopicAllowedUser
-      .joins(:user)
-      .where(topic_id: topic_id)
-      .where("users.admin = ? OR users.moderator = ?", true, true)
-      .exists?
-  end
-
-  def self.topic_involves_staff_groups?(topic_id)
-    # Falls eine PN z.B. an eine Staff/Mods/Admins-Gruppe ging.
-    # Discourse hat i.d.R. :staff, :admins, :moderators
-    staff_group_ids = []
-    [:staff, :admins, :moderators].each do |sym|
-      g = Group.find_by(name: sym.to_s)
-      staff_group_ids << g.id if g
-    end
-
-    return false if staff_group_ids.empty?
-
-    TopicAllowedGroup.where(topic_id: topic_id, group_id: staff_group_ids).exists?
-  end
-
-  def self.topic_has_team_or_system?(topic_id)
-    topic_involves_system?(topic_id) ||
-      topic_involves_staff_users?(topic_id) ||
-      topic_involves_staff_groups?(topic_id)
-  end
-
-  def self.pm_topic_ids_where_user_posted(user_id)
-    Post
-      .joins(:topic)
-      .where(user_id: user_id)
-      .where("topics.archetype = ?", Archetype.private_message)
-      .distinct
-      .pluck("topics.id")
-  end
-
-  def self.remove_user_from_pm_topics!(user)
-    topic_ids = pm_topic_ids_where_user_posted(user.id)
-    return 0 if topic_ids.blank?
-
-    removed_topics = 0
-
-    topic_ids.each do |tid|
-      # NICHT anfassen, wenn Team oder System vorkommt
-      next if topic_has_team_or_system?(tid)
-
-      # User aus Allowed-Users entfernen -> Topic ist für ihn nicht mehr sichtbar
-      deleted = TopicAllowedUser.where(topic_id: tid, user_id: user.id).delete_all
-
-      if deleted > 0
-        removed_topics += 1
-        # optional housekeeping (Unreads/Tracking)
-        TopicUser.where(topic_id: tid, user_id: user.id).delete_all
-      end
-    end
-
-    removed_topics
-  end
-
-  def self.shared_user_has_trigger_pm?(user, title)
-    return false if title.blank?
-
-    Topic
-      .joins(:topic_allowed_users)
-      .where("topics.archetype = ?", Archetype.private_message)
-      .where("topic_allowed_users.user_id = ?", user.id)
-      .where("topics.title = ?", title)
-      .exists?
-  end
-
-  def self.send_trigger_pm!(shared_user, reason: nil)
-    title = (SiteSetting.single_login_shared_trigger_pm_title || "").strip
-    body  = (SiteSetting.single_login_shared_trigger_pm_body  || "").to_s
-    return if title.blank? || body.blank?
-
-    # Nur senden, wenn der SharedUser keine sichtbare PM mit exakt dem Titel mehr hat
-    return if shared_user_has_trigger_pm?(shared_user, title)
-
-    sender_name = (SiteSetting.single_login_shared_sender_username || "").strip
-    sender = sender_name.present? ? User.find_by(username: sender_name) : nil
-    sender ||= Discourse.system_user
-
-    group_name = (SiteSetting.single_login_shared_notify_group || "").strip
-    target_group_names = []
-    target_group_names << group_name if group_name.present?
-
-    body = "#{body}\n\n(Logout-Grund: #{reason})" if reason.present?
-
-    PostCreator.create!(
-      sender,
-      title: title,
-      raw: body,
-      archetype: Archetype.private_message,
-      target_usernames: shared_user.username,
-      target_group_names: target_group_names
-    )
-  end
-
-  def self.handle_logout_side_effects!(user, reason: nil)
-    return unless SiteSetting.single_login_shared_enabled
-    return unless shared_user?(user)
-
-    remove_user_from_pm_topics!(user)
-    send_trigger_pm!(user, reason: reason)
-  end
-
 end
