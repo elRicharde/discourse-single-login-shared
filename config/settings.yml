@@ -39,5 +39,5 @@ plugins:
       Hinweis: Beiträge ohne passende Form werden nicht weitergeleitet. Bitte sachlich bleiben – Beschimpfungen sind unangebracht.
 
       Beiträge für das weiße Brett werden geprüft und vom HC freigeschaltet.
-    client: false
+    client: true  # for testingreasons
 
