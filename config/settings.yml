@@ -11,8 +11,10 @@ plugins:
     default: 2
     min: 1
     max: 1440
-
+    client: false
+    
   single_login_shared_max_session_minutes:
     default: 4
     min: 1
     max: 1440
+    client: false
