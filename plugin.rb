@@ -34,6 +34,11 @@ after_initialize do
     def self.clear_lock!(user_id)
       Discourse.redis.del(lock_key(user_id))
     end
+
+    def self.force_logout!(user)
+      UserLogout.new(user).log_out
+      clear_all_keys!(user.id)
+    end
   end
 
   ::SessionController.prepend Module.new {
