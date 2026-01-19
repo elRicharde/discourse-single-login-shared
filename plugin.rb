@@ -1,6 +1,6 @@
 # name: discourse-single-login-shared
 # about: Allow only one concurrent login for a specific shared user
-# version: 0.5
+# version: 0.6
 # authors: Richard
 
 enabled_site_setting :single_login_shared_enabled
@@ -36,7 +36,6 @@ after_initialize do
     end
   end
 
-  # Login sauber blocken: JSON-Error + 4xx (damit kein "Unbekannter Fehler")
   ::SessionController.prepend Module.new {
     def create
       return super unless SiteSetting.single_login_shared_enabled
@@ -45,35 +44,40 @@ after_initialize do
       user  = login.present? ? User.find_by_username_or_email(login) : nil
 
       if ::SingleLoginShared.shared_user?(user) && ::SingleLoginShared.locked?(user.id)
-        return render_json_error(
-          I18n.t("login.already_logged_in_single_session"),
-          status: 409
-        )
+        render json: { error: I18n.t("login.already_logged_in_single_session") }, status: 403
+        return
       end
 
       super
     ensure
-      u = (respond_to?(:current_user) ? current_user : nil)
+      u = respond_to?(:current_user) ? current_user : nil
       if SiteSetting.single_login_shared_enabled && ::SingleLoginShared.shared_user?(u)
         ::SingleLoginShared.touch_lock!(u.id)
       end
     end
-  }
 
-  # Anmeldung bei Logout richtig löschen
-  ::SessionController.prepend Module.new {
+    # Anmeldung bei Logout richtig löschen
     def destroy
       u = respond_to?(:current_user) ? current_user : nil
-
-      if SiteSetting.single_login_shared_enabled &&
-         ::SingleLoginShared.shared_user?(u)
+      if SiteSetting.single_login_shared_enabled && ::SingleLoginShared.shared_user?(u)
         ::SingleLoginShared.clear_lock!(u.id)
       end
-
       super
     end
   }
-  
+
+  # Anmeldung bei Admin-Logout löschen
+  Admin::UsersController.prepend Module.new {
+    def log_out
+      user_id = params[:user_id].to_i
+      u = User.find_by(id: user_id)
+      if SiteSetting.single_login_shared_enabled && ::SingleLoginShared.shared_user?(u)
+        ::SingleLoginShared.clear_lock!(u.id)
+      end
+      super
+    end
+  }
+
   # Inaktivitäts-Timeout: bei jedem Request verlängern
   DiscourseEvent.on(:current_user) do |user|
     if SiteSetting.single_login_shared_enabled && ::SingleLoginShared.shared_user?(user)
@@ -81,3 +85,4 @@ after_initialize do
     end
   end
 end
+
