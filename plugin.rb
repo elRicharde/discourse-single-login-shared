@@ -12,7 +12,7 @@ after_initialize do
     end
 
     def self.timeout_seconds
-      ((SiteSetting.single_login_shared_timeout_hours || 3).to_i * 3600)
+      ((SiteSetting.single_login_shared_timeout_hours || 5).to_i * 60)
     end
 
     def self.shared_user?(user)
