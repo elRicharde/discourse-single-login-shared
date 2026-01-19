@@ -43,7 +43,7 @@ after_initialize do
       if ::SingleLoginShared.shared_user?(user) && ::SingleLoginShared.locked?(user.id)
         return render_json_error(
           I18n.t("login.already_logged_in_single_session"),
-          status: 429
+          status: 499
         )
       end
 
