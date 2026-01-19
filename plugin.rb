@@ -56,6 +56,20 @@ after_initialize do
     end
   }
 
+  # Anmeldung bei Logout richtig löschen
+  ::SessionController.prepend Module.new {
+    def destroy
+      u = respond_to?(:current_user) ? current_user : nil
+
+      if SiteSetting.single_login_shared_enabled &&
+         ::SingleLoginShared.shared_user?(u)
+        ::SingleLoginShared.clear_lock!(u.id)
+      end
+
+      super
+    end
+  }
+  
   # Inaktivitäts-Timeout: bei jedem Request verlängern
   DiscourseEvent.on(:current_user) do |user|
     if SiteSetting.single_login_shared_enabled && ::SingleLoginShared.shared_user?(user)
