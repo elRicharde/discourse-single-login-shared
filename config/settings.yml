@@ -3,24 +3,18 @@ plugins:
     default: true
     client: false
 
-  # Komma-separierte Liste von Usernamen (z.B. "Antoinette,Fabienne")
-  single_login_shared_usernames:
-    default: "Antoinette,Louis"
+  single_login_shared_username:
+    default: "Antoinette"
     client: false
 
-  # Fester Timeout ab Login (Minuten). Danach wird hart ausgeloggt.
-  single_login_shared_timeout_minutes:
-    default: 180
+  single_login_shared_idle_timeout_minutes:
+    default: 2
     min: 1
     max: 1440
     client: false
-
-  # Sender (Username) für die automatische PN
-  single_login_shared_sender_username:
-    default: "Fabienne"
-    client: false
-
-  # Empfänger-Gruppe (ohne @), plus der SharedUser selbst (wird automatisch ergänzt)
-  single_login_shared_group:
-    default: "Schatzmeister.innen"
+    
+  single_login_shared_max_session_minutes:
+    default: 4
+    min: 1
+    max: 1440
     client: false

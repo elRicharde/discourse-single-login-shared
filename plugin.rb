@@ -1,155 +1,128 @@
 # name: discourse-single-login-shared
-# about: Allow only one concurrent login for specific shared users + forced logout + PM cleanup + notify
-# version: 1.5
+# about: Allow only one concurrent login for a specific shared user with idle + max session logout
+# version: 1.2
 # authors: Richard
 
 enabled_site_setting :single_login_shared_enabled
 
 after_initialize do
+  
   module ::SingleLoginShared
-    LOCK_PREFIX = "single_login_shared:lock:user:".freeze
-
-    def self.shared_usernames
-      raw = (SiteSetting.single_login_shared_usernames || "").strip
-      return [] if raw.empty?
-
-      raw.split(/[,\s;|]+/).map(&:strip).reject(&:empty?)
-    end
-
-    def self.timeout_minutes
-      (SiteSetting.single_login_shared_timeout_minutes || 180).to_i
-    end
-
-    def self.timeout_seconds
-      timeout_minutes * 60
+    def self.shared_username
+      (SiteSetting.single_login_shared_username || "").strip
     end
 
     def self.shared_user?(user)
-      user && shared_usernames.include?(user.username)
+      user && user.username == shared_username
     end
 
-    def self.lock_key(user_id)
-      "#{LOCK_PREFIX}#{user_id}"
+    def self.shared_user
+      u = shared_username
+      return nil if u.blank?
+      User.find_by(username: u)
     end
 
-    def self.lock_value(user_id)
-      Discourse.redis.get(lock_key(user_id))
+    def self.now
+      Time.now.to_i
     end
 
-    def self.locked?(user_id)
-      Discourse.redis.exists?(lock_key(user_id))
+    def self.idle_timeout_seconds
+      SiteSetting.single_login_shared_idle_timeout_minutes.to_i * 60
     end
 
-    # value = random token, so scheduled job can confirm it is still the same "login"
-    def self.set_lock!(user_id)
-      token = SecureRandom.hex(16)
-      Discourse.redis.setex(lock_key(user_id), timeout_seconds, token)
-      token
+    def self.max_session_seconds
+      SiteSetting.single_login_shared_max_session_minutes.to_i * 60
     end
 
-    def self.clear_lock!(user_id)
-      Discourse.redis.del(lock_key(user_id))
+    # Redis keys
+    def self.active_key(user_id)
+      "single_login_shared:active:user:#{user_id}"
     end
 
-    # --- Forced logout (best effort, without requiring internal files) ---
-    def self.force_logout_all_sessions!(user)
-      return if user.blank?
+    def self.login_started_key(user_id)
+      "single_login_shared:login_started:user:#{user_id}"
+    end
 
-      # Try known helpers if present
-      if defined?(UserAuthToken) && UserAuthToken.respond_to?(:log_out)
-        # Some versions have: UserAuthToken.log_out(user)
+    def self.last_activity_key(user_id)
+      "single_login_shared:last_activity:user:#{user_id}"
+    end
+
+    def self.active?(user_id)
+      Discourse.redis.exists?(active_key(user_id))
+    end
+
+    def self.mark_logged_in!(user_id)
+      t = now
+      Discourse.redis.set(active_key(user_id), "1")
+      Discourse.redis.set(login_started_key(user_id), t)
+      Discourse.redis.set(last_activity_key(user_id), t)
+    end
+
+    def self.touch_activity!(user_id)
+      Discourse.redis.set(last_activity_key(user_id), now)
+    end
+
+    def self.clear_all!(user_id)
+      Discourse.redis.del(active_key(user_id), login_started_key(user_id), last_activity_key(user_id))
+    end
+
+    def self.force_logout!(user)
+      # logout all sessions/tokens for this user
+      UserAuthToken.where(user_id: user.id).find_each do |t|
         begin
-          UserAuthToken.log_out(user)
-          return
+          t.log_out!(SessionManager.new(nil, nil))
         rescue
-          # fall through
+          # fallback: even if log_out! signature differs, destroying the token still invalidates sessions
+        ensure
+          t.destroy!
         end
       end
+    
+      clear_all!(user.id)
+    end
 
-      # Fallback: revoke all auth tokens (works on most modern Discourse)
-      if defined?(UserAuthToken)
-        UserAuthToken.where(user_id: user.id).update_all(revoked_at: Time.zone.now)
+    def self.should_logout?(user_id)
+      t = now
+      started = Discourse.redis.get(login_started_key(user_id)).to_i
+      last = Discourse.redis.get(last_activity_key(user_id)).to_i
+
+      # Wenn Keys fehlen, lieber nicht hart killen — aber active entfernen, falls inkonsistent
+      if started <= 0
+        return [:inconsistent, true]
       end
 
-      # Also bump "log out all sessions" marker if available
-      if user.respond_to?(:log_out_all_sessions!)
-        user.log_out_all_sessions!
+      # Max session (hart)
+      if max_session_seconds > 0 && (t - started) > max_session_seconds
+        return [:max_session, true]
       end
+
+      # Idle (seit letztem Request)
+      if last > 0 && idle_timeout_seconds > 0 && (t - last) > idle_timeout_seconds
+        return [:idle, true]
+      end
+
+      [:ok, false]
     end
 
-    # --- Remove the user from ALL PMs (so they disappear from inbox/sent) ---
-    def self.remove_user_from_all_pms!(user)
-      return if user.blank?
-      return unless defined?(TopicAllowedUser) && defined?(Topic) && defined?(Archetype)
+    def self.enforce_timeouts!
+      return unless SiteSetting.single_login_shared_enabled
 
-      TopicAllowedUser
-        .joins("JOIN topics ON topics.id = topic_allowed_users.topic_id")
-        .where(user_id: user.id)
-        .where("topics.archetype = ?", Archetype.private_message)
-        .delete_all
-    end
+      user = shared_user
+      return if user.nil?
 
-    # --- Send automation PM from configured sender to group + the shared user ---
-    def self.send_logout_pm!(shared_user)
-      return if shared_user.blank?
-      return unless defined?(PostCreator) && defined?(Archetype)
+      uid = user.id
+      return unless active?(uid)
 
-      sender_username = (SiteSetting.single_login_shared_sender_username || "").strip
-      group_name      = (SiteSetting.single_login_shared_group || "").strip
+      reason, logout = should_logout?(uid)
 
-      sender = User.find_by(username: sender_username)
-      return if sender.blank?
-
-      targets = []
-      targets << group_name unless group_name.empty?
-      targets << shared_user.username
-      target_usernames = targets.join(",")
-
-      title = "Shared-Login Logout: #{shared_user.username}"
-      raw   = "Der Shared-User **#{shared_user.username}** wurde ausgeloggt (Timeout/Logout).\n\nBitte ggf. Folgeprozess starten."
-
-      PostCreator.create!(
-        sender,
-        title: title,
-        raw: raw,
-        archetype: Archetype.private_message,
-        target_usernames: target_usernames
-      )
-    end
-
-    # --- One place that performs all “logout side effects” ---
-    def self.on_shared_user_logged_out!(user)
-      return unless shared_user?(user)
-
-      clear_lock!(user.id)
-      force_logout_all_sessions!(user)
-      remove_user_from_all_pms!(user)
-      send_logout_pm!(user)
-    end
-  end
-
-  # Sidekiq job that fires when the fixed timeout is reached
-  module ::SingleLoginShared
-    class ExpireJob < ::Jobs::Base
-      def execute(args)
-        user_id = args[:user_id].to_i
-        token   = args[:token].to_s
-        return if user_id <= 0 || token.empty?
-
-        # Only expire if the lock still exists and matches this token
-        current = ::SingleLoginShared.lock_value(user_id)
-        return if current.blank?
-        return unless current == token
-
-        user = User.find_by(id: user_id)
-        return if user.blank?
-
-        ::SingleLoginShared.on_shared_user_logged_out!(user)
+      if logout
+        # Inconsistency: active gesetzt aber timestamps fehlen -> Sessions beenden und sauber aufräumen
+        force_logout!(user)
       end
     end
   end
 
-  # Block login if locked; on successful login set lock AND schedule expiration job.
+  # 1) Login blocken + nach erfolgreichem Login markieren
   ::SessionController.prepend Module.new {
     def create
       return super unless SiteSetting.single_login_shared_enabled
@@ -157,48 +130,60 @@ after_initialize do
       login = params[:login] || params[:username] || params.dig(:session, :login)
       user  = login.present? ? User.find_by_username_or_email(login) : nil
 
-      if ::SingleLoginShared.shared_user?(user) && ::SingleLoginShared.locked?(user.id)
-        return render_json_error(
-          I18n.t("login.already_logged_in_single_session"),
-          status: 200
-        )
+      if ::SingleLoginShared.shared_user?(user) && ::SingleLoginShared.active?(user.id)
+        # Wichtig: Discourse Login-UI zeigt das zuverlässig an:
+        render json: { error: I18n.t("login.already_logged_in_single_session") }, status: 200
+        return
       end
 
       super
     ensure
       u = respond_to?(:current_user) ? current_user : nil
       if SiteSetting.single_login_shared_enabled && ::SingleLoginShared.shared_user?(u)
-        token = ::SingleLoginShared.set_lock!(u.id)
-
-        # schedule fixed expiration (minutes from now)
-        Jobs.enqueue_in(
-          ::SingleLoginShared.timeout_minutes.minutes,
-          ::SingleLoginShared::ExpireJob,
-          user_id: u.id,
-          token: token
-        )
+        ::SingleLoginShared.mark_logged_in!(u.id)
       end
     end
 
-    # Normal user logout via menu
+    # normaler Logout
     def destroy
       u = respond_to?(:current_user) ? current_user : nil
       if SiteSetting.single_login_shared_enabled && ::SingleLoginShared.shared_user?(u)
-        ::SingleLoginShared.on_shared_user_logged_out!(u)
+        ::SingleLoginShared.clear_all!(u.id)
       end
       super
     end
   }
 
-  # Admin "log out" button
+  # 2) Admin-Logout (Log out all sessions)
   Admin::UsersController.prepend Module.new {
     def log_out
       user_id = params[:user_id].to_i
       u = User.find_by(id: user_id)
+
       if SiteSetting.single_login_shared_enabled && ::SingleLoginShared.shared_user?(u)
-        ::SingleLoginShared.on_shared_user_logged_out!(u)
+        ::SingleLoginShared.clear_all!(u.id)
       end
+
       super
     end
   }
+
+  # 3) Bei jedem Request: Activity timestamp updaten (nur Shared User)
+  DiscourseEvent.on(:current_user) do |user|
+    next unless SiteSetting.single_login_shared_enabled
+    next unless ::SingleLoginShared.shared_user?(user)
+
+    ::SingleLoginShared.touch_activity!(user.id)
+  end
+
+  # 4) Scheduled Job: erzwingt Idle/Max logout unabhängig von Requests
+  module ::Jobs
+    class SingleLoginSharedEnforcer < ::Jobs::Scheduled
+      every 1.minute
+
+      def execute(args)
+        ::SingleLoginShared.enforce_timeouts!
+      end
+    end
+  end
 end
