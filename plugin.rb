@@ -30,6 +30,10 @@ after_initialize do
     def self.touch_lock!(user_id)
       Discourse.redis.setex(lock_key(user_id), timeout_seconds, "1")
     end
+
+    def self.clear_lock!(user_id)
+      Discourse.redis.del(lock_key(user_id))
+    end
   end
 
   # Login sauber blocken: JSON-Error + 4xx (damit kein "Unbekannter Fehler")
@@ -43,7 +47,7 @@ after_initialize do
       if ::SingleLoginShared.shared_user?(user) && ::SingleLoginShared.locked?(user.id)
         return render_json_error(
           I18n.t("login.already_logged_in_single_session"),
-          status: 499
+          status: 409
         )
       end
 
