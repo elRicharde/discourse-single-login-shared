@@ -45,9 +45,7 @@ after_initialize do
 
       if ::SingleLoginShared.shared_user?(user) && ::SingleLoginShared.locked?(user.id)
         render json: {
-          error: I18n.t("login.already_logged_in_single_session"),
-          errors: [I18n.t("login.already_logged_in_single_session")],
-          reason: "already_logged_in_single_session"
+          errors: [I18n.t("login.already_logged_in_single_session")]
         }, status: 422
         return
       end
