@@ -1,13 +1,12 @@
 # name: discourse-single-login-shared
 # about: Allow only one concurrent login for a specific shared user with idle + max session logout
-# version: 1.1
+# version: 1.2
 # authors: Richard
 
 enabled_site_setting :single_login_shared_enabled
 
 after_initialize do
-  require_dependency "user_logout"
-
+  
   module ::SingleLoginShared
     def self.shared_username
       (SiteSetting.single_login_shared_username || "").strip
@@ -68,8 +67,17 @@ after_initialize do
     end
 
     def self.force_logout!(user)
-      # echter Logout: invalidiert Sessions/Tokens wie UI/Admin-Logout
-      UserLogout.new(user).log_out
+      # logout all sessions/tokens for this user
+      UserAuthToken.where(user_id: user.id).find_each do |t|
+        begin
+          t.log_out!(SessionManager.new(nil, nil))
+        rescue
+          # fallback: even if log_out! signature differs, destroying the token still invalidates sessions
+        ensure
+          t.destroy!
+        end
+      end
+    
       clear_all!(user.id)
     end
 
