@@ -1,40 +1,39 @@
 # name: discourse-single-login-shared
-# about: Allow only one concurrent login for a specific shared user with idle + max session logout
-# version: 1.2
+# about: Allow only one concurrent login for specific shared users with static max session logout
+# version: 1.5
 # authors: Richard
 
 enabled_site_setting :single_login_shared_enabled
 
 after_initialize do
-  
+
   module ::SingleLoginShared
-    def self.shared_username
-      (SiteSetting.single_login_shared_username || "").strip
+    def self.shared_usernames
+      raw = (SiteSetting.single_login_shared_usernames || "").to_s
+      list = raw.split(",").map { |s| s.strip }.reject(&:blank?)
+
+      # optionaler Fallback, falls du noch irgendwo das alte Setting hattest
+      if list.empty? && SiteSetting.respond_to?(:single_login_shared_username)
+        old = (SiteSetting.single_login_shared_username || "").to_s.strip
+        list = [old] if old.present?
+      end
+
+      list
     end
 
     def self.shared_user?(user)
-      user && user.username == shared_username
-    end
-
-    def self.shared_user
-      u = shared_username
-      return nil if u.blank?
-      User.find_by(username: u)
+      user && shared_usernames.include?(user.username)
     end
 
     def self.now
       Time.now.to_i
     end
 
-    def self.idle_timeout_seconds
-      SiteSetting.single_login_shared_idle_timeout_minutes.to_i * 60
-    end
-
     def self.max_session_seconds
       SiteSetting.single_login_shared_max_session_minutes.to_i * 60
     end
 
-    # Redis keys
+    # Redis keys (pro User)
     def self.active_key(user_id)
       "single_login_shared:active:user:#{user_id}"
     end
@@ -43,27 +42,28 @@ after_initialize do
       "single_login_shared:login_started:user:#{user_id}"
     end
 
-    def self.last_activity_key(user_id)
-      "single_login_shared:last_activity:user:#{user_id}"
-    end
-
     def self.active?(user_id)
       Discourse.redis.exists?(active_key(user_id))
     end
 
     def self.mark_logged_in!(user_id)
-      t = now
-      Discourse.redis.set(active_key(user_id), "1")
-      Discourse.redis.set(login_started_key(user_id), t)
-      Discourse.redis.set(last_activity_key(user_id), t)
-    end
+      t   = now
+      ttl = max_session_seconds
 
-    def self.touch_activity!(user_id)
-      Discourse.redis.set(last_activity_key(user_id), now)
+      # Wenn ttl <= 0, setzen wir ohne TTL (aber Setting hat min:1, also normalerweise nie)
+      if ttl > 0
+        # kleine Reserve, damit es nicht exakt auf die Sekunde race-conditiont
+        exp = ttl + 60
+        Discourse.redis.setex(active_key(user_id), exp, "1")
+        Discourse.redis.setex(login_started_key(user_id), exp, t.to_s)
+      else
+        Discourse.redis.set(active_key(user_id), "1")
+        Discourse.redis.set(login_started_key(user_id), t.to_s)
+      end
     end
 
     def self.clear_all!(user_id)
-      Discourse.redis.del(active_key(user_id), login_started_key(user_id), last_activity_key(user_id))
+      Discourse.redis.del(active_key(user_id), login_started_key(user_id))
     end
 
     def self.force_logout!(user)
@@ -72,33 +72,27 @@ after_initialize do
         begin
           t.log_out!(SessionManager.new(nil, nil))
         rescue
-          # fallback: even if log_out! signature differs, destroying the token still invalidates sessions
+          # fallback: token destroy invalidiert ebenfalls
         ensure
           t.destroy!
         end
       end
-    
+
       clear_all!(user.id)
     end
 
     def self.should_logout?(user_id)
-      t = now
-      started = Discourse.redis.get(login_started_key(user_id)).to_i
-      last = Discourse.redis.get(last_activity_key(user_id)).to_i
+      started_s = Discourse.redis.get(login_started_key(user_id))
+      started   = started_s.to_i
 
-      # Wenn Keys fehlen, lieber nicht hart killen — aber active entfernen, falls inkonsistent
-      if started <= 0
-        return [:inconsistent, true]
-      end
+      # Wenn active gesetzt, aber started fehlt -> inkonsistent -> logout/cleanup
+      return [:inconsistent, true] if started <= 0
 
-      # Max session (hart)
-      if max_session_seconds > 0 && (t - started) > max_session_seconds
+      ttl = max_session_seconds
+      return [:ok, false] if ttl <= 0
+
+      if (now - started) > ttl
         return [:max_session, true]
-      end
-
-      # Idle (seit letztem Request)
-      if last > 0 && idle_timeout_seconds > 0 && (t - last) > idle_timeout_seconds
-        return [:idle, true]
       end
 
       [:ok, false]
@@ -107,17 +101,16 @@ after_initialize do
     def self.enforce_timeouts!
       return unless SiteSetting.single_login_shared_enabled
 
-      user = shared_user
-      return if user.nil?
+      # Für alle konfigurierten Shared-User prüfen
+      shared_usernames.each do |uname|
+        user = User.find_by(username: uname)
+        next if user.nil?
 
-      uid = user.id
-      return unless active?(uid)
+        uid = user.id
+        next unless active?(uid)
 
-      reason, logout = should_logout?(uid)
-
-      if logout
-        # Inconsistency: active gesetzt aber timestamps fehlen -> Sessions beenden und sauber aufräumen
-        force_logout!(user)
+        _reason, logout = should_logout?(uid)
+        force_logout!(user) if logout
       end
     end
   end
@@ -131,7 +124,6 @@ after_initialize do
       user  = login.present? ? User.find_by_username_or_email(login) : nil
 
       if ::SingleLoginShared.shared_user?(user) && ::SingleLoginShared.active?(user.id)
-        # Wichtig: Discourse Login-UI zeigt das zuverlässig an:
         render json: { error: I18n.t("login.already_logged_in_single_session") }, status: 200
         return
       end
@@ -168,15 +160,7 @@ after_initialize do
     end
   }
 
-  # 3) Bei jedem Request: Activity timestamp updaten (nur Shared User)
-  DiscourseEvent.on(:current_user) do |user|
-    next unless SiteSetting.single_login_shared_enabled
-    next unless ::SingleLoginShared.shared_user?(user)
-
-    ::SingleLoginShared.touch_activity!(user.id)
-  end
-
-  # 4) Scheduled Job: erzwingt Idle/Max logout unabhängig von Requests
+  # 3) Scheduled Job: erzwingt Max-Session Logout unabhängig von Requests
   module ::Jobs
     class SingleLoginSharedEnforcer < ::Jobs::Scheduled
       every 1.minute
