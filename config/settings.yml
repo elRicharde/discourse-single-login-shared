@@ -4,7 +4,7 @@ plugins:
     client: false
 
   single_login_shared_username:
-    default: "shared_account"
+    default: "Antoinette"
     client: false
 
   single_login_shared_timeout_minutes:
