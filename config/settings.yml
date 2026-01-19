@@ -14,3 +14,30 @@ plugins:
     min: 1
     max: 1440
     client: true  # for testingreasons
+
+  single_login_shared_sender_username:
+    default: "HC_MOCK_MEMBER"
+    client: true  # for testingreasons
+
+  single_login_shared_notify_group:
+    default: "Schatzmeister.innen"
+    client: true  # for testingreasons
+
+  # Titel der Trigger-PN (genau dieser Titel wird auf "existiert schon?" geprüft)
+  single_login_shared_trigger_pm_title:
+    default: "Anonymes Feedback zu Vorgang/Person ODER Eintrag am weißen Brett"
+    client: true  # for testingreasons
+
+  # Text der Trigger-PN
+  single_login_shared_trigger_pm_body:
+    default: |
+      Bitte passe den Titel entsprechend an.
+
+      - Bei "Eintrag weißes Brett": Wie soll der Thread heißen?
+      - Bei "Anonymes Feedback": Anonymes Feedback zu [xyz]
+
+      Hinweis: Beiträge ohne passende Form werden nicht weitergeleitet. Bitte sachlich bleiben – Beschimpfungen sind unangebracht.
+
+      Beiträge für das weiße Brett werden geprüft und vom HC freigeschaltet.
+    client: false
+
