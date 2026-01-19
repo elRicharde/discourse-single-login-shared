@@ -7,7 +7,12 @@ plugins:
     default: "Antoinette"
     client: false
 
-  single_login_shared_timeout_minutes:
-    default: 5
+  single_login_shared_idle_timeout_minutes:
+    default: 2
+    min: 1
+    max: 1440
+
+  single_login_shared_max_session_minutes:
+    default: 4
     min: 1
     max: 1440
